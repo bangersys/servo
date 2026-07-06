@@ -13,6 +13,12 @@ description.workspace = true
 name = "servo_media_auto"
 path = "lib.rs"
 
+[features]
+media-mpv = ["servo-media-mpv"]
+
+[dependencies]
+servo-media-mpv = { workspace = true, optional = true }
+
 [target.'cfg(any(all(target_os = "android", any(target_arch = "arm", target_arch = "aarch64")), target_arch = "x86_64",target_arch = "aarch64"))'.dependencies]
 servo-media-gstreamer = { workspace = true }
 

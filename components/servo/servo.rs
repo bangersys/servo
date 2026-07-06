@@ -93,7 +93,20 @@ use crate::webview_delegate::{
     FilePicker, NavigationRequest, PermissionRequest, ProtocolHandlerRegistration, WebResourceLoad,
 };
 
-#[cfg(feature = "media-gstreamer")]
+#[cfg(feature = "media-mpv")]
+mod media_platform {
+    use servo_media_mpv::MpvBackend;
+
+    use super::ServoMedia;
+    pub fn init() {
+        ServoMedia::init::<MpvBackend>();
+    }
+}
+
+#[cfg(all(
+    not(feature = "media-mpv"),
+    feature = "media-gstreamer"
+))]
 mod media_platform {
     use servo_media_gstreamer::GStreamerBackend;
 
@@ -126,7 +139,11 @@ mod media_platform {
     }
 }
 
-#[cfg(all(not(feature = "media-gstreamer"), target_env = "ohos"))]
+#[cfg(all(
+    not(feature = "media-mpv"),
+    not(feature = "media-gstreamer"),
+    target_env = "ohos"
+))]
 mod media_platform {
     use servo_media_ohos::OhosBackend;
 
@@ -136,7 +153,11 @@ mod media_platform {
     }
 }
 
-#[cfg(all(not(feature = "media-gstreamer"), not(target_env = "ohos")))]
+#[cfg(all(
+    not(feature = "media-mpv"),
+    not(feature = "media-gstreamer"),
+    not(target_env = "ohos")
+))]
 mod media_platform {
     use super::ServoMedia;
     pub fn init() {

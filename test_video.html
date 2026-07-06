@@ -1,0 +1,15 @@
+<!DOCTYPE html>
+<html>
+<head><title>Video Test</title></head>
+<body>
+<video id="v" autoplay muted controls width="640" height="360"
+  src="tests/wpt/mozilla/tests/mozilla/resources/video.mp4">
+</video>
+<script>
+  var v = document.getElementById('v');
+  v.onloadedmetadata = function() { console.log('Video loaded: ' + v.videoWidth + 'x' + v.videoHeight); };
+  v.onplay = function() { console.log('Playing'); };
+  v.onerror = function() { console.log('Error: ' + v.error.message); };
+</script>
+</body>
+</html>

@@ -115,13 +115,13 @@ impl GStreamerBackend {
         let (backend_chan, recvr) = mpsc::channel();
         thread::Builder::new()
             .name("GStreamerBackend ShutdownThread".to_owned())
-            .spawn(move || {
-                match recvr.recv().unwrap() {
-                    BackendMsg::Shutdown {
+            .spawn(move || loop {
+                match recvr.recv() {
+                    Ok(BackendMsg::Shutdown {
                         context,
                         id,
                         tx_ack,
-                    } => {
+                    }) => {
                         let mut instances_ = instances_.lock().unwrap();
                         if let Some(vec) = instances_.get_mut(&context) {
                             vec.retain(|m| m.0 != id);
@@ -132,6 +132,7 @@ impl GStreamerBackend {
                         // tell caller we are done removing this instance
                         let _ = tx_ack.send(());
                     },
+                    Err(_) => break,
                 };
             })
             .unwrap();

@@ -1,0 +1,27 @@
+[package]
+name = "servo-media-mpv"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+edition.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description.workspace = true
+
+[lib]
+name = "servo_media_mpv"
+path = "lib.rs"
+
+[dependencies]
+khronos-egl = { workspace = true }
+libloading = "0.8"
+libmpv2 = "6"
+log = { workspace = true }
+servo-base = { workspace = true }
+servo-media = { workspace = true }
+servo-media-audio = { workspace = true }
+servo-media-player = { workspace = true }
+servo-media-streams = { workspace = true }
+servo-media-traits = { workspace = true }
+servo-media-webrtc = { workspace = true }

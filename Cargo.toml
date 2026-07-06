@@ -140,6 +140,7 @@ ipc-channel = "0.22"
 itertools = "0.15"
 jni = "0.22"
 js = { package = "mozjs", version = "=0.18", default-features = false, features = ["intl", "libz-sys"] }
+khronos-egl = { version = "6", features = ["dynamic"] }
 k12 = "0.5"
 keyboard-types = { version = "0.8.3", features = ["serde", "webdriver"] }
 kurbo = { version = "0.13.1", features = ["euclid"] }
@@ -343,6 +344,7 @@ servo-media-auto = { version = "=0.4.0", path = "components/media/backends/auto"
 servo-media-derive = { version = "=0.4.0", path = "components/media/servo-media-derive" }
 servo-media-dummy = { version = "=0.4.0", path = "components/media/backends/dummy" }
 servo-media-gstreamer = { version = "=0.4.0", path = "components/media/backends/gstreamer" }
+servo-media-mpv = { version = "=0.4.0", path = "components/media/backends/mpv" }
 servo-media-gstreamer-render = { version = "=0.4.0", path = "components/media/backends/gstreamer/render" }
 servo-media-gstreamer-render-android = { version = "=0.4.0", path = "components/media/backends/gstreamer/render-android" }
 servo-media-gstreamer-render-unix = { version = "=0.4.0", path = "components/media/backends/gstreamer/render-unix" }
