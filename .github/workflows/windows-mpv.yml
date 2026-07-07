@@ -97,8 +97,10 @@ jobs:
           echo "DLL: $($dllFile.FullName)"
           echo "GNU import lib: $($dllA.FullName)"
 
-          # Export INCLUDE for the linker to find mpv headers
-          echo "INCLUDE=$($incDir.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          # Store mpv include/lib paths as separate env vars.
+          # Do NOT write to INCLUDE/LIB directly — that replaces the standard
+          # MSVC/Windows SDK paths and breaks clang-cl (used by mozangle).
+          echo "MPV_INCLUDE_DIR=$($incDir.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
 
           # Generate an MSVC-compatible import library from the DLL's exports
           # using dumpbin + lib.exe (both ship with VS Build Tools).
@@ -135,8 +137,8 @@ jobs:
           if (-not (Test-Path $libOutPath)) { echo "ERROR: lib.exe failed to produce mpv.lib"; exit 1 }
           echo "Generated MSVC import lib: $libOutPath"
 
-          # Export LIB so the linker finds mpv.lib
-          echo "LIB=$genDir" | Out-File -FilePath $env:GITHUB_ENV -Append
+          # Store mpv lib dir separately — merged into INCLUDE/LIB only for the Build step
+          echo "MPV_LIB_DIR=$genDir" | Out-File -FilePath $env:GITHUB_ENV -Append
 
           # Export path so Copy DLLs step can find libmpv-2.dll
           echo "MPV_DLL=$($dllFile.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
@@ -144,9 +146,19 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Debug env (before build)
+        shell: powershell
+        run: |
+          echo "INCLUDE=$env:INCLUDE"
+          echo "LIB=$env:LIB"
+          echo "MPV_INCLUDE_DIR=$env:MPV_INCLUDE_DIR"
+          echo "MPV_LIB_DIR=$env:MPV_LIB_DIR"
+
       - name: Build (${{ inputs.profile }})
         env:
           RUSTFLAGS: ${{ inputs.profile == 'checked-release' && '-D warnings' || '' }}
+          INCLUDE: ${{ env.MPV_INCLUDE_DIR }};${{ env.INCLUDE }}
+          LIB: ${{ env.MPV_LIB_DIR }};${{ env.LIB }}
         run: |
           .\mach build --use-crown --locked --profile ${{ inputs.profile }} --features media-mpv
           mv C:\a\servo\servo\target\cargo-timings C:\a\servo\servo\target\cargo-timings-windows
