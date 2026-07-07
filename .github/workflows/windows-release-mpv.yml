@@ -16,7 +16,10 @@ on:
 
 env:
   RUST_BACKTRACE: 1
-  CARGO_TARGET_DIR: C:\a\servo\servo\target
+  SHELL: /bin/bash
+  CARGO_TARGET_DIR: C:\\a\\servo\\servo\\target
+  # clang_sys will search msys path before Program Files\LLVM
+  LIBCLANG_PATH: C:\Program Files\LLVM\bin
   RUSTUP_WINDOWS_PATH_ADD_BIN: 1
 
 jobs:
@@ -111,11 +114,6 @@ jobs:
       - name: Build
         shell: powershell
         run: |
-          $targetDir = "C:\a\servo\servo\target\${{ inputs.profile }}"
-          if (Test-Path $targetDir) {
-            echo "Cleaning previous build: $targetDir"
-            Remove-Item -Recurse -Force $targetDir -ErrorAction SilentlyContinue
-          }
           $profile = "${{ inputs.profile }}"
           $profileArg = ""
           if ($profile -eq "release") {
@@ -157,25 +155,44 @@ jobs:
             echo "WARNING: MPV_DLL env var not set or file not found"
           }
           echo "Copying MSVC redistributable DLLs..."
-          $pyScript = @"
-import sys, os
-sys.path.insert(0, '.')
-try:
-    from python.servo.build_commands import package_msvc_dlls
-    from python.servo.platform.build_target import BuildTarget
-    target = BuildTarget.from_triple(None)
-    servo_dir = r'''$targetDir'''.replace(chr(92), '/')
-    os.makedirs(servo_dir, exist_ok=True)
-    result = package_msvc_dlls(servo_dir, target)
-    if not result:
-        print('WARNING: Some MSVC DLLs could not be copied')
-except Exception as e:
-    print('ERROR copying MSVC DLLs: ' + str(e))
-    sys.exit(1)
-"@
-          $pyScript | Out-File -FilePath "$env:TEMP\copy_dlls.py" -Encoding utf8
-          python "$env:TEMP\copy_dlls.py"
-          if ($LASTEXITCODE -ne 0) { throw "Failed to copy MSVC DLLs" }
+          $vsWhere = "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path $vsWhere)) {
+            $vsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          }
+          $vsPath = & $vsWhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          echo "Visual Studio: $vsPath"
+          $redistBase = Join-Path $vsPath "VC\Redist\MSVC"
+          if (Test-Path $redistBase) {
+            $redistDir = Get-ChildItem $redistBase -Directory | Sort-Object Name -Descending | Select-Object -First 1
+            $redistX64 = Join-Path $redistDir.FullName "x64"
+            if (Test-Path $redistX64) {
+              foreach ($dll in @("msvcp140.dll", "vcruntime140.dll")) {
+                $src = Join-Path $redistX64 $dll
+                if (Test-Path $src) {
+                  Copy-Item $src -Destination $targetDir -Force
+                  echo "Copied $dll from $src"
+                } else {
+                  echo "WARNING: $dll not found in $redistX64"
+                }
+              }
+            }
+          } else {
+            echo "WARNING: MSVC Redist directory not found"
+          }
+          echo "Copying Windows SDK UCRT DLL..."
+          $sdkReg = Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows Kits\Installed Roots" -Name "KitsRoot10" -ErrorAction SilentlyContinue
+          if ($sdkReg) {
+            $sdkBinDir = Join-Path $sdkReg.KitsRoot10 "bin"
+            $ucrtDll = Get-ChildItem $sdkBinDir -Recurse -Filter "api-ms-win-crt-runtime-l1-1-0.dll" -ErrorAction SilentlyContinue | Where-Object { $_.DirectoryName -like "*x64*" } | Sort-Object FullName -Descending | Select-Object -First 1
+            if ($ucrtDll) {
+              Copy-Item $ucrtDll.FullName -Destination $targetDir -Force
+              echo "Copied api-ms-win-crt-runtime-l1-1-0.dll"
+            } else {
+              echo "WARNING: UCRT DLL not found in SDK"
+            }
+          } else {
+            echo "WARNING: Windows SDK not found in registry"
+          }
           echo "DLLs in target directory:"
           Get-ChildItem $targetDir -Filter "*.dll" | Select-Object Name,Length
 
