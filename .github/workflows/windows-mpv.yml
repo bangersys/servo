@@ -37,6 +37,7 @@ jobs:
       - name: Bootstrap
         run: |
           .\mach fetch
+          .\mach bootstrap-gstreamer
 
       # Always install crown, even on self-hosted runners, because it is tightly
       # coupled to the rustc version, and we may have the wrong version if the
@@ -152,79 +153,21 @@ jobs:
         env:
           RUSTFLAGS: ${{ inputs.profile == 'checked-release' && '-D warnings' || '' }}
         run: |
-          cargo build -p servoshell --features media-mpv --locked --profile ${{ inputs.profile }}
+          .\mach build --use-crown --locked --profile ${{ inputs.profile }} --features media-mpv
           mv C:\a\servo\servo\target\cargo-timings C:\a\servo\servo\target\cargo-timings-windows
 
-      - name: Copy DLLs to binary directory
+      - name: Copy libmpv DLL to binary directory
         shell: powershell
         run: |
-          $profile = "${{ inputs.profile }}"
-          $targetDir = "C:\a\servo\servo\target\$profile"
-          echo "Target dir: $targetDir"
-          if (-not (Test-Path $targetDir)) {
-            throw "Target directory not found: $targetDir"
-          }
-
-          # Copy ANGLE DLLs from the cargo build output tree
-          echo "Copying ANGLE DLLs..."
-          $buildDir = "$targetDir\build"
-          foreach ($dll in @("libEGL.dll", "libGLESv2.dll")) {
-            $found = Get-ChildItem -Path $buildDir -Recurse -Filter $dll -ErrorAction SilentlyContinue | Select-Object -First 1
-            if ($found) {
-              Copy-Item $found.FullName -Destination $targetDir -Force
-              echo "  Copied $dll from $($found.FullName)"
-            } else {
-              echo "  WARNING: $dll not found in build directory"
-            }
-          }
-
-          # Copy libmpv-2.dll
-          echo "Copying libmpv DLL..."
+          $targetDir = "C:\a\servo\servo\target\${{ inputs.profile }}"
+          echo "Copying libmpv-2.dll to $targetDir..."
           if ($env:MPV_DLL -and (Test-Path $env:MPV_DLL)) {
             Copy-Item $env:MPV_DLL -Destination $targetDir -Force
             echo "  Copied libmpv DLL from $($env:MPV_DLL)"
           } else {
-            echo "  WARNING: MPV_DLL env var not set or file not found"
+            echo "  ERROR: MPV_DLL env var not set or file not found"
+            exit 1
           }
-
-          # Copy MSVC redistributable DLLs
-          echo "Copying MSVC redistributable DLLs..."
-          $vsWhere = "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe"
-          $vsPath = & $vsWhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
-          $redistBase = Join-Path $vsPath "VC\Redist\MSVC"
-          if (Test-Path $redistBase) {
-            $redistDir = Get-ChildItem $redistBase -Directory | Sort-Object Name -Descending | Select-Object -First 1
-            $redistX64 = Join-Path $redistDir.FullName "x64"
-            foreach ($dll in @("msvcp140.dll", "vcruntime140.dll")) {
-              $src = Join-Path $redistX64 $dll
-              if (Test-Path $src) {
-                Copy-Item $src -Destination $targetDir -Force
-                echo "  Copied $dll"
-              } else {
-                echo "  WARNING: $dll not found in $redistX64"
-              }
-            }
-          } else {
-            echo "  WARNING: MSVC Redist directory not found"
-          }
-
-          # Copy Windows SDK UCRT DLL
-          echo "Copying Windows SDK UCRT DLL..."
-          $sdkReg = Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows Kits\Installed Roots" -Name "KitsRoot10" -ErrorAction SilentlyContinue
-          if ($sdkReg) {
-            $ucrtDll = Get-ChildItem (Join-Path $sdkReg.KitsRoot10 "bin") -Recurse -Filter "api-ms-win-crt-runtime-l1-1-0.dll" -ErrorAction SilentlyContinue | Where-Object { $_.DirectoryName -like "*x64*" } | Sort-Object FullName -Descending | Select-Object -First 1
-            if ($ucrtDll) {
-              Copy-Item $ucrtDll.FullName -Destination $targetDir -Force
-              echo "  Copied api-ms-win-crt-runtime-l1-1-0.dll"
-            } else {
-              echo "  WARNING: UCRT DLL not found in SDK"
-            }
-          } else {
-            echo "  WARNING: Windows SDK not found in registry"
-          }
-
-          echo "DLLs in target directory:"
-          Get-ChildItem $targetDir -Filter "*.dll" | Select-Object Name,Length
 
       - name: Copy resources
         # GitHub-hosted runners sometimes check out the repo on D: drive.
