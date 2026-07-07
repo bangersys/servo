@@ -1,0 +1,250 @@
+name: Windows Build (media-mpv)
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        required: false
+        default: "release"
+        options: ["checked-release", "release", "debug", "production"]
+        type: choice
+
+env:
+  RUST_BACKTRACE: 1
+  SHELL: /bin/bash
+  CARGO_TARGET_DIR: C:\\a\\servo\\servo\\target
+  # clang_sys will search msys path before Program Files\LLVM
+  # so we need to override this behaviour until we update clang-sys
+  # https://github.com/KyleMayes/clang-sys/issues/150
+  LIBCLANG_PATH: C:\Program Files\LLVM\bin
+  RUSTUP_WINDOWS_PATH_ADD_BIN: 1
+
+jobs:
+  build:
+    name: Windows Build (media-mpv) [${{ inputs.profile }}]
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+      - run: |
+          echo CCACHE=ccache >> $GITHUB_ENV
+
+      - name: Setup Python
+        uses: ./.github/actions/setup-python
+
+      - name: Bootstrap
+        run: |
+          .\mach fetch
+
+      # Always install crown, even on self-hosted runners, because it is tightly
+      # coupled to the rustc version, and we may have the wrong version if the
+      # commit we are building uses a different rustc version.
+      - name: Install crown
+        run: cargo install --path support/crown --force
+
+      - name: Install libmpv
+        shell: powershell
+        run: |
+          # Download latest libmpv from shinchiro's mpv-winbuild-cmake GitHub releases.
+          # These are MinGW-w64 builds, so we must convert libmpv.dll.a to MSVC mpv.lib.
+
+          echo "Querying latest mpv-winbuild-cmake release..."
+          $headers = @{ Authorization = "Bearer $env:GITHUB_TOKEN"; "User-Agent" = "servo-ci" }
+          $release = Invoke-RestMethod -Uri "https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/releases/latest" -Headers $headers
+          echo "Release tag: $($release.tag_name)"
+
+          # Match plain x86_64 dev package only - NOT x86_64-v3 (AVX2)
+          $asset = $release.assets | Where-Object { $_.name -match '^mpv-dev-x86_64-\d.*\.7z$' } | Select-Object -First 1
+          if (-not $asset) {
+            echo "ERROR: Could not find mpv-dev-x86_64 asset in latest release"
+            echo "Available assets:"
+            $release.assets | ForEach-Object { echo "  - $($_.name)" }
+            exit 1
+          }
+          echo "Found asset: $($asset.name) ($($asset.size) bytes)"
+
+          $archive = "$env:TEMP\mpv-dev.7z"
+          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $archive -Headers @{ "User-Agent" = "servo-ci" }
+
+          $fileSize = (Get-Item $archive).Length
+          echo "Downloaded size: $fileSize bytes"
+          if ($fileSize -lt 1000000) {
+            echo "ERROR: Downloaded file is suspiciously small ($fileSize bytes) - not a valid archive"
+            Get-Content $archive -TotalCount 20
+            exit 1
+          }
+
+          echo "Extracting libmpv..."
+          7z x $archive -o"C:\libmpv" -y
+          if ($LASTEXITCODE -ne 0) { throw "7z extraction failed with exit code $LASTEXITCODE" }
+
+          echo "Extracted files:"
+          Get-ChildItem "C:\libmpv" -Recurse -File | Select-Object FullName
+
+          # Find include dir, DLL, and GNU import library
+          $incDir = Get-ChildItem "C:\libmpv" -Recurse -Directory -Filter "include" | Where-Object { Test-Path "$($_.FullName)\mpv" } | Select-Object -First 1
+          $dllFile = Get-ChildItem "C:\libmpv" -Recurse -Filter "libmpv*.dll" | Select-Object -First 1
+          $dllA = Get-ChildItem "C:\libmpv" -Recurse -Filter "libmpv*.dll.a" | Select-Object -First 1
+
+          if (-not $incDir) { echo "ERROR: Could not find mpv headers (include/mpv)"; exit 1 }
+          if (-not $dllFile) { echo "ERROR: Could not find libmpv DLL"; exit 1 }
+          if (-not $dllA) { echo "ERROR: Could not find libmpv.dll.a import stub"; exit 1 }
+
+          echo "Include dir: $($incDir.FullName)"
+          echo "DLL: $($dllFile.FullName)"
+          echo "GNU import lib: $($dllA.FullName)"
+
+          # Export INCLUDE for the linker to find mpv headers
+          echo "INCLUDE=$($incDir.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+          # Generate an MSVC-compatible import library from the DLL's exports
+          # using dumpbin + lib.exe (both ship with VS Build Tools).
+          $vsWhere = "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsPath = & $vsWhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vsPath) { echo "ERROR: Could not locate Visual Studio installation"; exit 1 }
+          $msvcToolsBase = Join-Path $vsPath "VC\Tools\MSVC"
+          $msvcVerDir = Get-ChildItem $msvcToolsBase -Directory | Sort-Object Name -Descending | Select-Object -First 1
+          $hostBin = Join-Path $msvcVerDir.FullName "bin\Hostx64\x64"
+          $dumpbin = Join-Path $hostBin "dumpbin.exe"
+          $libExe = Join-Path $hostBin "lib.exe"
+          if (-not (Test-Path $dumpbin)) { echo "ERROR: dumpbin.exe not found at $dumpbin"; exit 1 }
+          if (-not (Test-Path $libExe)) { echo "ERROR: lib.exe not found at $libExe"; exit 1 }
+
+          # Build .def from DLL exports
+          $genDir = "C:\libmpv-msvc"
+          New-Item -ItemType Directory -Path $genDir -Force | Out-Null
+          $defPath = Join-Path $genDir "mpv.def"
+          $dumpbinOutput = & $dumpbin /exports $dllFile.FullName
+          $defLines = @("LIBRARY $($dllFile.BaseName)", "EXPORTS")
+          $inExportsTable = $false
+          foreach ($line in $dumpbinOutput) {
+            if ($line -match "ordinal\s+hint\s+RVA\s+name") { $inExportsTable = $true; continue }
+            if ($inExportsTable -and ($line -match "^\s*\d+\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]+\s+(\S+)")) {
+              $defLines += "    $($Matches[1])"
+            }
+          }
+          if ($defLines.Count -le 2) { echo "ERROR: No exports parsed from dumpbin output"; exit 1 }
+          $defLines | Out-File -FilePath $defPath -Encoding ascii
+          echo "Generated .def with $($defLines.Count - 2) exports"
+
+          $libOutPath = Join-Path $genDir "mpv.lib"
+          & $libExe "/def:$defPath" "/out:$libOutPath" "/machine:x64" | Out-Null
+          if (-not (Test-Path $libOutPath)) { echo "ERROR: lib.exe failed to produce mpv.lib"; exit 1 }
+          echo "Generated MSVC import lib: $libOutPath"
+
+          # Export LIB so the linker finds mpv.lib
+          echo "LIB=$genDir" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+          # Export path so Copy DLLs step can find libmpv-2.dll
+          echo "MPV_DLL=$($dllFile.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Build (${{ inputs.profile }})
+        env:
+          RUSTFLAGS: ${{ inputs.profile == 'checked-release' && '-D warnings' || '' }}
+        run: |
+          cargo build -p servoshell --features media-mpv --locked --profile ${{ inputs.profile }}
+          mv C:\a\servo\servo\target\cargo-timings C:\a\servo\servo\target\cargo-timings-windows
+
+      - name: Copy DLLs to binary directory
+        shell: powershell
+        run: |
+          $profile = "${{ inputs.profile }}"
+          $targetDir = "C:\a\servo\servo\target\$profile"
+          echo "Target dir: $targetDir"
+          if (-not (Test-Path $targetDir)) {
+            throw "Target directory not found: $targetDir"
+          }
+
+          # Copy ANGLE DLLs from the cargo build output tree
+          echo "Copying ANGLE DLLs..."
+          $buildDir = "$targetDir\build"
+          foreach ($dll in @("libEGL.dll", "libGLESv2.dll")) {
+            $found = Get-ChildItem -Path $buildDir -Recurse -Filter $dll -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($found) {
+              Copy-Item $found.FullName -Destination $targetDir -Force
+              echo "  Copied $dll from $($found.FullName)"
+            } else {
+              echo "  WARNING: $dll not found in build directory"
+            }
+          }
+
+          # Copy libmpv-2.dll
+          echo "Copying libmpv DLL..."
+          if ($env:MPV_DLL -and (Test-Path $env:MPV_DLL)) {
+            Copy-Item $env:MPV_DLL -Destination $targetDir -Force
+            echo "  Copied libmpv DLL from $($env:MPV_DLL)"
+          } else {
+            echo "  WARNING: MPV_DLL env var not set or file not found"
+          }
+
+          # Copy MSVC redistributable DLLs
+          echo "Copying MSVC redistributable DLLs..."
+          $vsWhere = "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsPath = & $vsWhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          $redistBase = Join-Path $vsPath "VC\Redist\MSVC"
+          if (Test-Path $redistBase) {
+            $redistDir = Get-ChildItem $redistBase -Directory | Sort-Object Name -Descending | Select-Object -First 1
+            $redistX64 = Join-Path $redistDir.FullName "x64"
+            foreach ($dll in @("msvcp140.dll", "vcruntime140.dll")) {
+              $src = Join-Path $redistX64 $dll
+              if (Test-Path $src) {
+                Copy-Item $src -Destination $targetDir -Force
+                echo "  Copied $dll"
+              } else {
+                echo "  WARNING: $dll not found in $redistX64"
+              }
+            }
+          } else {
+            echo "  WARNING: MSVC Redist directory not found"
+          }
+
+          # Copy Windows SDK UCRT DLL
+          echo "Copying Windows SDK UCRT DLL..."
+          $sdkReg = Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows Kits\Installed Roots" -Name "KitsRoot10" -ErrorAction SilentlyContinue
+          if ($sdkReg) {
+            $ucrtDll = Get-ChildItem (Join-Path $sdkReg.KitsRoot10 "bin") -Recurse -Filter "api-ms-win-crt-runtime-l1-1-0.dll" -ErrorAction SilentlyContinue | Where-Object { $_.DirectoryName -like "*x64*" } | Sort-Object FullName -Descending | Select-Object -First 1
+            if ($ucrtDll) {
+              Copy-Item $ucrtDll.FullName -Destination $targetDir -Force
+              echo "  Copied api-ms-win-crt-runtime-l1-1-0.dll"
+            } else {
+              echo "  WARNING: UCRT DLL not found in SDK"
+            }
+          } else {
+            echo "  WARNING: Windows SDK not found in registry"
+          }
+
+          echo "DLLs in target directory:"
+          Get-ChildItem $targetDir -Filter "*.dll" | Select-Object Name,Length
+
+      - name: Copy resources
+        # GitHub-hosted runners sometimes check out the repo on D: drive.
+        if: ${{ startsWith(github.workspace, 'D:\') }}
+        run: cp D:\a\servo\servo\resources C:\a\servo\servo -Recurse
+
+      - name: Smoketest
+        run: .\mach smoketest --profile ${{ inputs.profile }}
+
+      - name: Build mach package
+        run: .\mach package --profile ${{ inputs.profile }}
+
+      # These files are available
+      # MSI Installer: C:\a\servo\servo\target\${{ inputs.profile }}\msi\Installer.msi
+      # Bundle: C:\a\servo\servo\target\${{ inputs.profile }}\msi\ServoShell.exe
+      # Zip: C:\a\servo\servo\target\${{ inputs.profile }}\msi\ServoShell.zip
+      - name: Upload artifact for mach package
+        uses: actions/upload-artifact@v7
+        id: upload-exe
+        with:
+          name: ${{ inputs.profile }}-binary-windows-mpv
+          path: C:\\a\\servo\\servo\\target\\${{ inputs.profile }}\\msi\\ServoShell.exe
+          if-no-files-found: error
