@@ -1,16 +1,15 @@
 name: Main
 
 on:
-  push:
-    # Run the entire pipeline for 'main' even though the merge queue already runs checks
-    # for every change. This just offers an extra layer of testing and covers the case of
-    # random force pushes.
-    branches: ["main"]
-  pull_request:
-    types: ['opened', 'synchronize']
-    branches: ["**"]
-  merge_group:
-    types: [checks_requested]
+  # DISABLED: Auto-triggers disabled to prevent running all platform builds on push.
+  # Use workflow_dispatch to run manually, or use windows-release-mpv.yml for Windows builds.
+  # push:
+  #   branches: ["main"]
+  # pull_request:
+  #   types: ['opened', 'synchronize']
+  #   branches: ["**"]
+  # merge_group:
+  #   types: [checks_requested]
   workflow_dispatch:
 
 jobs:
