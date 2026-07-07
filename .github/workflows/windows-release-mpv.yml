@@ -66,23 +66,57 @@ jobs:
 
       - name: Download and install libmpv
         shell: powershell
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          $url = "https://sourceforge.net/projects/mpv-player-windows/files/libmpv/mpv-dev-x86_64-20260607-git-71ebd08.7z/download"
-          $archive = "$env:TEMP\mpv-dev.7z"
-          echo "Downloading libmpv from SourceForge..."
           [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-          Invoke-WebRequest -Uri $url -OutFile $archive -MaximumRedirection 5
+
+          echo "Querying latest mpv-winbuild-cmake release..."
+          $headers = @{ Authorization = "Bearer $env:GH_TOKEN"; "User-Agent" = "servo-ci" }
+          $release = Invoke-RestMethod -Uri "https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/releases/latest" -Headers $headers
+
+          echo "Release tag: $($release.tag_name)"
+
+          # Match plain x86_64 dev package only - NOT the x86_64-v3 (AVX2) variant,
+          # which also matches a naive "mpv-dev-x86_64-*" wildcard.
+          $asset = $release.assets | Where-Object { $_.name -match '^mpv-dev-x86_64-\d.*\.7z$' } | Select-Object -First 1
+
+          if (-not $asset) {
+            echo "ERROR: Could not find mpv-dev-x86_64 asset in latest release"
+            echo "Available assets:"
+            $release.assets | ForEach-Object { echo " - $($_.name)" }
+            exit 1
+          }
+
+          echo "Found asset: $($asset.name) (expected size: $($asset.size) bytes)"
+
+          $archive = "$env:TEMP\mpv-dev.7z"
+          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $archive -Headers @{ "User-Agent" = "servo-ci" }
+
+          $fileSize = (Get-Item $archive).Length
+          echo "Downloaded size: $fileSize bytes"
+          if ($fileSize -lt 1000000) {
+            echo "ERROR: Downloaded file is suspiciously small ($fileSize bytes) - likely not a valid archive"
+            echo "First 500 bytes as text (to check if it's an HTML error page):"
+            Get-Content $archive -TotalCount 20
+            exit 1
+          }
+
           echo "Extracting libmpv..."
           7z x $archive -o"C:\libmpv" -y
+          if ($LASTEXITCODE -ne 0) { throw "7z extraction failed with exit code $LASTEXITCODE" }
+
           $mpvDir = Get-ChildItem "C:\libmpv" -Directory | Select-Object -First 1
           if ($mpvDir) {
             echo "Found libmpv in: $($mpvDir.FullName)"
             echo "Contents:"
             Get-ChildItem $mpvDir.FullName -Recurse -File | Select-Object -First 30
           }
+
           $libDir = Get-ChildItem "C:\libmpv" -Recurse -Directory -Filter "lib*" | Where-Object { Test-Path "$($_.FullName)\mpv.lib" } | Select-Object -First 1
           $incDir = Get-ChildItem "C:\libmpv" -Recurse -Directory -Filter "include" | Where-Object { Test-Path "$($_.FullName)\mpv" } | Select-Object -First 1
           $binDir = Get-ChildItem "C:\libmpv" -Recurse -Directory -Filter "bin" | Where-Object { Get-ChildItem $_.FullName -Filter "*mpv*.dll" } | Select-Object -First 1
+
           if ($libDir) {
             echo "LIB_DIR=$($libDir.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
             $currentLib = [Environment]::GetEnvironmentVariable("LIB", "Process")
@@ -93,6 +127,7 @@ jobs:
             Get-ChildItem "C:\libmpv" -Recurse -Filter "*.lib" | Select-Object FullName
             exit 1
           }
+
           if ($incDir) {
             $currentInclude = [Environment]::GetEnvironmentVariable("INCLUDE", "Process")
             echo "INCLUDE=$currentInclude;$($incDir.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
@@ -101,6 +136,7 @@ jobs:
             echo "ERROR: Could not find mpv headers"
             exit 1
           }
+
           if ($binDir) {
             $dllFile = Get-ChildItem $binDir.FullName -Filter "*mpv*.dll" | Select-Object -First 1
             if ($dllFile) {
