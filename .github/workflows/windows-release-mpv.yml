@@ -106,46 +106,72 @@ jobs:
           7z x $archive -o"C:\libmpv" -y
           if ($LASTEXITCODE -ne 0) { throw "7z extraction failed with exit code $LASTEXITCODE" }
 
-          $mpvDir = Get-ChildItem "C:\libmpv" -Directory | Select-Object -First 1
-          if ($mpvDir) {
-            echo "Found libmpv in: $($mpvDir.FullName)"
-            echo "Contents:"
-            Get-ChildItem $mpvDir.FullName -Recurse -File | Select-Object -First 30
-          }
+          echo "Full extracted layout:"
+          Get-ChildItem "C:\libmpv" -Recurse -File | Select-Object FullName
 
-          $libDir = Get-ChildItem "C:\libmpv" -Recurse -Directory -Filter "lib*" | Where-Object { Test-Path "$($_.FullName)\mpv.lib" } | Select-Object -First 1
+          # shinchiro's mpv-winbuild-cmake releases ship FLAT - no lib/ or bin/
+          # subfolders - and are built with MinGW-w64, so the import library is
+          # "libmpv.dll.a" (GNU ar format), not an MSVC-compatible "mpv.lib".
+          # Since this toolchain targets x86_64-pc-windows-msvc, link.exe can't
+          # consume the .dll.a directly - we generate a real MSVC .lib from the
+          # DLL's exports using dumpbin + lib.exe (both ship with VS Build Tools).
+
           $incDir = Get-ChildItem "C:\libmpv" -Recurse -Directory -Filter "include" | Where-Object { Test-Path "$($_.FullName)\mpv" } | Select-Object -First 1
-          $binDir = Get-ChildItem "C:\libmpv" -Recurse -Directory -Filter "bin" | Where-Object { Get-ChildItem $_.FullName -Filter "*mpv*.dll" } | Select-Object -First 1
+          $dllFile = Get-ChildItem "C:\libmpv" -Recurse -Filter "libmpv*.dll" | Select-Object -First 1
+          $dllA = Get-ChildItem "C:\libmpv" -Recurse -Filter "libmpv*.dll.a" | Select-Object -First 1
 
-          if ($libDir) {
-            echo "LIB_DIR=$($libDir.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
-            $currentLib = [Environment]::GetEnvironmentVariable("LIB", "Process")
-            echo "LIB=$currentLib;$($libDir.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
-            echo "Library dir: $($libDir.FullName)"
-          } else {
-            echo "ERROR: Could not find mpv.lib in extracted archive"
-            Get-ChildItem "C:\libmpv" -Recurse -Filter "*.lib" | Select-Object FullName
-            exit 1
-          }
+          if (-not $incDir) { echo "ERROR: Could not find mpv headers (include/mpv)"; exit 1 }
+          if (-not $dllFile) { echo "ERROR: Could not find libmpv DLL"; exit 1 }
+          if (-not $dllA) { echo "ERROR: Could not find libmpv.dll.a import stub"; exit 1 }
 
-          if ($incDir) {
-            $currentInclude = [Environment]::GetEnvironmentVariable("INCLUDE", "Process")
-            echo "INCLUDE=$currentInclude;$($incDir.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
-            echo "Include dir: $($incDir.FullName)"
-          } else {
-            echo "ERROR: Could not find mpv headers"
-            exit 1
-          }
+          echo "Include dir: $($incDir.FullName)"
+          echo "DLL: $($dllFile.FullName)"
+          echo "GNU import lib (source for conversion): $($dllA.FullName)"
 
-          if ($binDir) {
-            $dllFile = Get-ChildItem $binDir.FullName -Filter "*mpv*.dll" | Select-Object -First 1
-            if ($dllFile) {
-              echo "MPV_DLL=$($dllFile.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
-              echo "DLL: $($dllFile.FullName)"
+          $currentInclude = [Environment]::GetEnvironmentVariable("INCLUDE", "Process")
+          echo "INCLUDE=$currentInclude;$($incDir.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+          # Locate VS Build Tools (dumpbin.exe, lib.exe)
+          $vsWhere = "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsPath = & $vsWhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vsPath) { echo "ERROR: Could not locate Visual Studio installation via vswhere"; exit 1 }
+          $msvcToolsBase = Join-Path $vsPath "VC\Tools\MSVC"
+          $msvcVerDir = Get-ChildItem $msvcToolsBase -Directory | Sort-Object Name -Descending | Select-Object -First 1
+          $hostBin = Join-Path $msvcVerDir.FullName "bin\Hostx64\x64"
+          $dumpbin = Join-Path $hostBin "dumpbin.exe"
+          $libExe = Join-Path $hostBin "lib.exe"
+          if (-not (Test-Path $dumpbin)) { echo "ERROR: dumpbin.exe not found at $dumpbin"; exit 1 }
+          if (-not (Test-Path $libExe)) { echo "ERROR: lib.exe not found at $libExe"; exit 1 }
+
+          # Build a .def from the DLL's exports
+          $genDir = "C:\libmpv-msvc"
+          New-Item -ItemType Directory -Path $genDir -Force | Out-Null
+          $defPath = Join-Path $genDir "mpv.def"
+          $dumpbinOutput = & $dumpbin /exports $dllFile.FullName
+
+          $defLines = @("LIBRARY $($dllFile.BaseName)", "EXPORTS")
+          $inExportsTable = $false
+          foreach ($line in $dumpbinOutput) {
+            if ($line -match "ordinal\s+hint\s+RVA\s+name") { $inExportsTable = $true; continue }
+            if ($inExportsTable -and ($line -match "^\s*\d+\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]+\s+(\S+)")) {
+              $defLines += "    $($Matches[1])"
             }
-          } else {
-            echo "WARNING: Could not find mpv DLL"
           }
+          if ($defLines.Count -le 2) { echo "ERROR: No exports parsed from dumpbin output"; exit 1 }
+          $defLines | Out-File -FilePath $defPath -Encoding ascii
+
+          echo "Generated .def with $($defLines.Count - 2) exports"
+
+          $libOutPath = Join-Path $genDir "mpv.lib"
+          & $libExe "/def:$defPath" "/out:$libOutPath" "/machine:x64" | Out-Null
+          if (-not (Test-Path $libOutPath)) { echo "ERROR: lib.exe failed to produce mpv.lib"; exit 1 }
+
+          echo "Generated MSVC-compatible import lib: $libOutPath"
+
+          echo "LIB_DIR=$genDir" | Out-File -FilePath $env:GITHUB_ENV -Append
+          $currentLib = [Environment]::GetEnvironmentVariable("LIB", "Process")
+          echo "LIB=$currentLib;$genDir" | Out-File -FilePath $env:GITHUB_ENV -Append
+          echo "MPV_DLL=$($dllFile.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Build
         shell: powershell
