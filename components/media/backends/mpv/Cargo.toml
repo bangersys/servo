@@ -17,6 +17,7 @@ path = "lib.rs"
 khronos-egl = { workspace = true }
 libloading = "0.8"
 libmpv2 = "6"
+libmpv2-sys = "4"
 log = { workspace = true }
 servo-base = { workspace = true }
 servo-media = { workspace = true }

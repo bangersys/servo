@@ -3,6 +3,7 @@ use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 
 use libmpv2::{Format, Mpv};
+use log::warn;
 use servo_base::generic_channel::GenericCallback;
 use servo_media::MediaInstanceError;
 use servo_media_player::audio::AudioRenderer;
@@ -31,6 +32,7 @@ pub struct MpvPlayer {
     stream_type: StreamType,
     stream_registry: Arc<Mutex<StreamRegistry>>,
     loaded: Mutex<bool>,
+    observer: Arc<Mutex<GenericCallback<PlayerEvent>>>,
 }
 
 impl MpvPlayer {
@@ -65,8 +67,12 @@ impl MpvPlayer {
         let observer = Arc::new(Mutex::new(observer));
         start_event_loop(mpv_arc.clone(), observer.clone());
 
-        let render_handle =
-            render::spawn_render_thread(mpv_arc.clone(), gl_context, video_renderer, observer);
+        let render_handle = render::spawn_render_thread(
+            mpv_arc.clone(),
+            gl_context,
+            video_renderer,
+            observer.clone(),
+        );
 
         MpvPlayer {
             id,
@@ -79,16 +85,26 @@ impl MpvPlayer {
             stream_type,
             stream_registry: registry,
             loaded: Mutex::new(false),
+            observer,
         }
     }
 
     fn load_if_needed(&self) -> Result<(), PlayerError> {
         let mut loaded = self.loaded.lock().unwrap();
         if !*loaded {
+            warn!("mpv loadfile: servo://{}", self.stream_id);
             self.mpv
                 .command("loadfile", &[&format!("servo://{}", self.stream_id)])
                 .map_err(|e| PlayerError::Backend(format!("mpv loadfile failed: {e}")))?;
             *loaded = true;
+            // Unlock the BufferedDataSource so data from the fetch
+            // pipeline starts flowing to mpv's stream buffer.
+            warn!("mpv loadfile: sending NeedData");
+            self.observer
+                .lock()
+                .unwrap()
+                .send(PlayerEvent::NeedData)
+                .ok();
         }
         Ok(())
     }
@@ -133,13 +149,13 @@ impl Player for MpvPlayer {
         if self.stream_type == StreamType::Stream {
             return vec![];
         }
-        if let Ok(dur) = self.mpv.get_property::<f64>("duration") {
-            if dur > 0.0 {
-                return vec![Range {
-                    start: 0.0,
-                    end: dur,
-                }];
-            }
+        if let Ok(dur) = self.mpv.get_property::<f64>("duration")
+            && dur > 0.0
+        {
+            return vec![Range {
+                start: 0.0,
+                end: dur,
+            }];
         }
         vec![]
     }
@@ -164,11 +180,15 @@ impl Player for MpvPlayer {
         self.mpv.get_property::<f64>("volume").unwrap_or(100.0) / 100.0
     }
 
-    fn set_input_size(&self, _size: u64) -> Result<(), PlayerError> {
+    fn set_input_size(&self, size: u64) -> Result<(), PlayerError> {
+        warn!("mpv set_input_size: {} bytes", size);
+        self.load_if_needed()?;
         Ok(())
     }
 
-    fn set_seekable(&self, _seekable: bool) -> Result<(), PlayerError> {
+    fn set_seekable(&self, seekable: bool) -> Result<(), PlayerError> {
+        warn!("mpv set_seekable: {}", seekable);
+        self.load_if_needed()?;
         Ok(())
     }
 
@@ -183,6 +203,11 @@ impl Player for MpvPlayer {
     }
 
     fn push_data(&self, data: Vec<u8>) -> Result<(), PlayerError> {
+        warn!(
+            "mpv push_data: {} bytes (loaded={})",
+            data.len(),
+            *self.loaded.lock().unwrap()
+        );
         self.load_if_needed()?;
         self.stream.push_data(&data);
         if self.stream.is_buffer_full() {

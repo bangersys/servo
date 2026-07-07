@@ -8480,6 +8480,7 @@ dependencies = [
  "khronos-egl",
  "libloading 0.8.9",
  "libmpv2",
+ "libmpv2-sys",
  "log",
  "servo-base",
  "servo-media",

@@ -2,12 +2,9 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-//! Mpv GL render path. Creates a dedicated per-player render thread with a
-//! shared EGL context, mpv `RenderContext`, and FBO-based texture output.
-//!
-//! Cargo.toml additions needed:
-//!   khronos-egl = { workspace = true }
-//!   libloading  = { workspace = true }  # libloading is a transitive dep of khronos-egl[dynamic]
+//! Mpv GL and software render paths. Creates a dedicated per-player render
+//! thread with either a shared EGL context + FBO-based texture output (GL) or
+//! a CPU-side pixel buffer (software).
 
 use std::ffi::c_void;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -131,6 +128,23 @@ fn mpv_get_proc_address(ctx: &MpvGlCtx, name: &str) -> *mut c_void {
 }
 
 // ---------------------------------------------------------------------------
+// Software buffer – holds CPU-side pixel data (BGRA8)
+// ---------------------------------------------------------------------------
+
+#[allow(dead_code)]
+pub struct SwBuffer {
+    pub data: Arc<Vec<u8>>,
+    pub width: i32,
+    pub height: i32,
+}
+
+impl Buffer for SwBuffer {
+    fn to_vec(&self) -> Option<VideoFrameData> {
+        Some(VideoFrameData::Raw(self.data.clone()))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
 
@@ -161,26 +175,36 @@ pub fn spawn_render_thread(
     let gl_ctx = gl_context.get_gl_context();
     let gl_api = gl_context.get_gl_api();
 
-    let (egl_display_ptr, app_egl_context_ptr) = match (native_display, gl_ctx) {
-        (NativeDisplay::Egl(d), GlContext::Egl(c)) => (d, c),
-        _ => {
-            warn!("spawn_render_thread: non-EGL context, disabling GL rendering");
-            return RenderHandle {
-                shutdown_tx: tx,
-                thread: None,
-                is_gl: false,
-            };
+    match (native_display, gl_ctx) {
+        (NativeDisplay::Egl(d), GlContext::Egl(c)) => {
+            // ---------- EGL / OpenGL path ----------
+            spawn_gl_render_thread(mpv, d, c, gl_api, video_renderer, observer, tx, rx)
         },
-    };
+        _ => {
+            warn!("spawn_render_thread: non-EGL context, falling back to software render");
+            spawn_sw_render_thread(mpv, video_renderer, observer, tx, rx)
+        },
+    }
+}
 
-    // Clone the sender so the update callback inside the thread can also
-    // send Wakeup commands.
+/// OpenGL / EGL render thread – shared context, FBO output.
+#[allow(clippy::too_many_arguments)]
+fn spawn_gl_render_thread(
+    mpv: Arc<Mpv>,
+    egl_display_ptr: usize,
+    app_egl_context_ptr: usize,
+    gl_api: GlApi,
+    video_renderer: Option<Arc<Mutex<dyn VideoFrameRenderer>>>,
+    observer: Arc<Mutex<GenericCallback<PlayerEvent>>>,
+    tx: Sender<RenderCommand>,
+    rx: Receiver<RenderCommand>,
+) -> RenderHandle {
     let wakeup_tx = tx.clone();
 
     let thread = match thread::Builder::new()
-        .name("MpvRender".into())
+        .name("MpvRenderGL".into())
         .spawn(move || {
-            render_thread_main(
+            gl_render_thread_main(
                 mpv,
                 egl_display_ptr,
                 app_egl_context_ptr,
@@ -193,7 +217,7 @@ pub fn spawn_render_thread(
         }) {
         Ok(h) => Some(h),
         Err(e) => {
-            error!("spawn_render_thread: failed to spawn thread: {e}");
+            error!("spawn_gl_render_thread: failed to spawn thread: {e}");
             return RenderHandle {
                 shutdown_tx: tx,
                 thread: None,
@@ -209,12 +233,45 @@ pub fn spawn_render_thread(
     }
 }
 
+/// Software render thread – CPU-side pixel buffer.
+fn spawn_sw_render_thread(
+    mpv: Arc<Mpv>,
+    video_renderer: Option<Arc<Mutex<dyn VideoFrameRenderer>>>,
+    observer: Arc<Mutex<GenericCallback<PlayerEvent>>>,
+    tx: Sender<RenderCommand>,
+    rx: Receiver<RenderCommand>,
+) -> RenderHandle {
+    let wakeup_tx = tx.clone();
+
+    let thread = match thread::Builder::new()
+        .name("MpvRenderSw".into())
+        .spawn(move || {
+            sw_render_thread_main(mpv, video_renderer, observer, rx, wakeup_tx);
+        }) {
+        Ok(h) => Some(h),
+        Err(e) => {
+            error!("spawn_sw_render_thread: failed to spawn thread: {e}");
+            return RenderHandle {
+                shutdown_tx: tx,
+                thread: None,
+                is_gl: false,
+            };
+        },
+    };
+
+    RenderHandle {
+        shutdown_tx: tx,
+        thread,
+        is_gl: false,
+    }
+}
+
 // ---------------------------------------------------------------------------
-// Render thread body
+// GL render thread body
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::too_many_arguments)]
-fn render_thread_main(
+fn gl_render_thread_main(
     mpv: Arc<Mpv>,
     egl_display_ptr: usize,
     app_egl_context_ptr: usize,
@@ -286,8 +343,7 @@ fn render_thread_main(
     };
 
     // ---------- 5. Bind API ----------
-    if egl_inst.bind_api(egl::OPENGL_ES_API).is_err()
-        && egl_inst.bind_api(egl::OPENGL_API).is_err()
+    if egl_inst.bind_api(egl::OPENGL_ES_API).is_err() && egl_inst.bind_api(egl::OPENGL_API).is_err()
     {
         warn!("render_thread: eglBindAPI failed");
         return;
@@ -498,4 +554,198 @@ fn render_thread_main(
     let _ = egl_inst.destroy_surface(display, surface);
     let _ = egl_inst.destroy_context(display, context);
     let _ = egl_inst.terminate(display);
+}
+
+// ---------------------------------------------------------------------------
+// Software render thread body
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::too_many_arguments)]
+fn sw_render_thread_main(
+    mpv: Arc<Mpv>,
+    video_renderer: Option<Arc<Mutex<dyn VideoFrameRenderer>>>,
+    observer: Arc<Mutex<GenericCallback<PlayerEvent>>>,
+    rx: Receiver<RenderCommand>,
+    wakeup_tx: Sender<RenderCommand>,
+) {
+    // ---------- 1. Create mpv RenderContext with API type "sw" ----------
+    let api_type = libmpv2_sys::MPV_RENDER_API_TYPE_SW.as_ptr() as *mut std::ffi::c_void;
+
+    let raw_params = vec![
+        libmpv2_sys::mpv_render_param {
+            type_: libmpv2_sys::mpv_render_param_type_MPV_RENDER_PARAM_API_TYPE,
+            data: api_type,
+        },
+        libmpv2_sys::mpv_render_param {
+            type_: 0,
+            data: std::ptr::null_mut(),
+        },
+    ];
+
+    let raw_array =
+        Box::into_raw(raw_params.into_boxed_slice()) as *mut libmpv2_sys::mpv_render_param;
+
+    let mut ctx_ptr: *mut libmpv2_sys::mpv_render_context = std::ptr::null_mut();
+    let result = unsafe {
+        libmpv2_sys::mpv_render_context_create(
+            &mut ctx_ptr as *mut *mut libmpv2_sys::mpv_render_context,
+            mpv.ctx.as_ptr(),
+            raw_array,
+        )
+    };
+    unsafe {
+        drop(Box::from_raw(raw_array));
+    }
+
+    if result != 0 {
+        warn!("sw_render_thread: mpv_render_context_create failed: {result}");
+        return;
+    }
+    warn!("sw_render_thread: mpv_render_context_create OK");
+
+    let render_ctx: Box<libmpv2_sys::mpv_render_context> = unsafe { Box::from_raw(ctx_ptr) };
+    // We need a raw pointer we can pass through FFI for the update callback.
+    let ctx_raw: *mut libmpv2_sys::mpv_render_context = Box::into_raw(render_ctx);
+
+    // ---------- 2. Set update callback ----------
+    unsafe extern "C" fn update_callback(ctx: *mut std::ffi::c_void) {
+        let sender = ctx as *const Sender<RenderCommand>;
+        let _ = unsafe { (*sender).send(RenderCommand::Wakeup) };
+    }
+
+    let sender_for_mpv: *mut Sender<RenderCommand> = Box::into_raw(Box::new(wakeup_tx.clone()));
+
+    unsafe {
+        libmpv2_sys::mpv_render_context_set_update_callback(
+            ctx_raw,
+            Some(update_callback),
+            sender_for_mpv as *mut std::ffi::c_void,
+        );
+    }
+
+    // ---------- 3. Render loop ----------
+    warn!("sw_render_thread: entering render loop");
+    let mut pixel_data: Vec<u8> = Vec::new();
+    let mut current_width: i32 = 0;
+    let mut current_height: i32 = 0;
+
+    'render: loop {
+        let cmd = match rx.recv() {
+            Ok(c) => c,
+            Err(_) => {
+                warn!("sw_render_thread: channel closed, exiting");
+                break 'render;
+            },
+        };
+
+        match cmd {
+            RenderCommand::Shutdown => {
+                warn!("sw_render_thread: Shutdown received");
+                break 'render;
+            },
+            RenderCommand::Wakeup => {},
+        }
+
+        let flags = unsafe { libmpv2_sys::mpv_render_context_update(ctx_raw) };
+
+        if flags & (libmpv2_sys::mpv_render_update_flag_MPV_RENDER_UPDATE_FRAME as u64) == 0 {
+            warn!("sw_render_thread: update returned flags={flags}, no frame");
+            continue;
+        }
+
+        let width = mpv.get_property::<i64>("width").unwrap_or(0) as i32;
+        let height = mpv.get_property::<i64>("height").unwrap_or(0) as i32;
+
+        if width <= 0 || height <= 0 {
+            warn!("sw_render_thread: invalid dimensions {width}x{height}");
+            continue;
+        }
+
+        warn!("sw_render_thread: rendering frame {width}x{height}");
+
+        // Allocate or grow the pixel buffer when the video size changes.
+        if width != current_width || height != current_height {
+            let stride = width * 4; // BGRA8 = 4 bytes per pixel
+            let size = (stride * height) as usize;
+            pixel_data.resize(size, 0u8);
+            current_width = width;
+            current_height = height;
+        }
+
+        let mut stride = width * 4; // BGRA8 = 4 bytes per pixel
+
+        let mut render_params: Vec<libmpv2_sys::mpv_render_param> = Vec::with_capacity(5);
+        // SW_SIZE: int[2] = {width, height}
+        let mut sw_size: [i32; 2] = [width, height];
+        render_params.push(libmpv2_sys::mpv_render_param {
+            type_: libmpv2_sys::mpv_render_param_type_MPV_RENDER_PARAM_SW_SIZE,
+            data: &mut sw_size as *mut [i32; 2] as *mut std::ffi::c_void,
+        });
+        // SW_FORMAT: "bgra"
+        let format = b"bgra\0";
+        render_params.push(libmpv2_sys::mpv_render_param {
+            type_: libmpv2_sys::mpv_render_param_type_MPV_RENDER_PARAM_SW_FORMAT,
+            data: format.as_ptr() as *mut std::ffi::c_void,
+        });
+        // SW_STRIDE: int
+        render_params.push(libmpv2_sys::mpv_render_param {
+            type_: libmpv2_sys::mpv_render_param_type_MPV_RENDER_PARAM_SW_STRIDE,
+            data: &mut stride as *mut i32 as *mut std::ffi::c_void,
+        });
+        // SW_POINTER: void*
+        render_params.push(libmpv2_sys::mpv_render_param {
+            type_: libmpv2_sys::mpv_render_param_type_MPV_RENDER_PARAM_SW_POINTER,
+            data: pixel_data.as_mut_ptr() as *mut std::ffi::c_void,
+        });
+        // terminator
+        render_params.push(libmpv2_sys::mpv_render_param {
+            type_: 0,
+            data: std::ptr::null_mut(),
+        });
+
+        let render_array =
+            Box::into_raw(render_params.into_boxed_slice()) as *mut libmpv2_sys::mpv_render_param;
+
+        let ret = unsafe { libmpv2_sys::mpv_render_context_render(ctx_raw, render_array) };
+        unsafe {
+            drop(Box::from_raw(render_array));
+        }
+
+        if ret != 0 {
+            error!("sw_render_thread: mpv_render_context_render failed: {ret}");
+            continue;
+        }
+
+        let frame = VideoFrame::new(
+            width,
+            height,
+            Arc::new(SwBuffer {
+                data: Arc::new(pixel_data.clone()),
+                width,
+                height,
+            }),
+        );
+
+        if let Some(ref video_renderer) = video_renderer
+            && let Some(frame) = frame
+            && let Ok(mut guard) = video_renderer.lock()
+        {
+            guard.render(frame);
+            warn!("sw_render_thread: frame rendered and sent to VideoFrameRenderer");
+        } else {
+            warn!("sw_render_thread: frame NOT rendered (missing VideoFrameRenderer)");
+        }
+
+        if let Ok(guard) = observer.lock() {
+            let _ = guard.send(PlayerEvent::VideoFrameUpdated);
+            warn!("sw_render_thread: VideoFrameUpdated sent");
+        }
+    }
+
+    warn!("sw_render_thread: exiting");
+    // ---------- 4. Cleanup ----------
+    unsafe {
+        libmpv2_sys::mpv_render_context_free(ctx_raw);
+        drop(Box::from_raw(sender_for_mpv));
+    }
 }

@@ -36,6 +36,7 @@ use crate::player::MpvPlayer;
 
 pub struct MpvBackend {
     capture_mocking: AtomicBool,
+    #[allow(clippy::type_complexity)]
     instances: Arc<Mutex<HashMap<ClientContextId, Vec<(usize, Weak<Mutex<dyn MediaInstance>>)>>>>,
     next_instance_id: AtomicUsize,
     backend_chan: Arc<Mutex<Sender<BackendMsg>>>,
@@ -67,8 +68,12 @@ impl MpvBackend {
 
 impl BackendInit for MpvBackend {
     fn init() -> Box<dyn Backend> {
-        let instances: HashMap<ClientContextId, Vec<(usize, Weak<Mutex<dyn MediaInstance>>)>> =
-            HashMap::new();
+        warn!("servo-media-mpv: initializing MpvBackend");
+        #[allow(clippy::type_complexity)]
+        let instances: HashMap<
+            ClientContextId,
+            Vec<(usize, Weak<Mutex<dyn MediaInstance>>)>,
+        > = HashMap::new();
         let instances = Arc::new(Mutex::new(instances));
 
         let instances_ = instances.clone();
@@ -76,24 +81,20 @@ impl BackendInit for MpvBackend {
         std::thread::Builder::new()
             .name("MpvBackend ShutdownThread".to_owned())
             .spawn(move || {
-                loop {
-                    match recvr.recv() {
-                        Ok(BackendMsg::Shutdown {
-                            context,
-                            id,
-                            tx_ack,
-                        }) => {
-                            let mut instances_ = instances_.lock().unwrap();
-                            if let Some(vec) = instances_.get_mut(&context) {
-                                vec.retain(|m| m.0 != id);
-                                if vec.is_empty() {
-                                    instances_.remove(&context);
-                                }
-                            }
-                            let _ = tx_ack.send(());
-                        },
-                        Err(_) => break,
-                    };
+                while let Ok(BackendMsg::Shutdown {
+                    context,
+                    id,
+                    tx_ack,
+                }) = recvr.recv()
+                {
+                    let mut instances_ = instances_.lock().unwrap();
+                    if let Some(vec) = instances_.get_mut(&context) {
+                        vec.retain(|m| m.0 != id);
+                        if vec.is_empty() {
+                            instances_.remove(&context);
+                        }
+                    }
+                    let _ = tx_ack.send(());
                 }
             })
             .unwrap();

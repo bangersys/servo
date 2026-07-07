@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use libmpv2::events::{Event, PropertyData};
 use libmpv2::{Error, Mpv, mpv_end_file_reason};
+use log::warn;
 use servo_base::generic_channel::GenericCallback;
 use servo_media_player::metadata::Metadata;
 use servo_media_player::{PlaybackState, PlayerEvent};
@@ -34,13 +35,18 @@ fn handle_event(
 ) {
     match event {
         Event::EndFile(reason) => {
+            warn!("mpv event: EndFile reason={}", reason as i32);
             if reason == mpv_end_file_reason::Eof {
                 notify(observer, PlayerEvent::EndOfStream);
             } else if reason == mpv_end_file_reason::Error {
                 notify(observer, PlayerEvent::Error("Playback error".to_owned()));
             }
         },
+        Event::StartFile => {
+            warn!("mpv event: StartFile");
+        },
         Event::FileLoaded => {
+            warn!("mpv event: FileLoaded");
             let duration = mpv.get_property::<f64>("duration").ok().and_then(|d| {
                 if d > 0.0 {
                     let secs = d.trunc() as u64;
@@ -65,6 +71,11 @@ fn handle_event(
             };
             notify(observer, PlayerEvent::MetadataUpdated(metadata));
             notify(observer, PlayerEvent::DurationChanged(duration));
+            // Must be sent after MetadataUpdated so that the HTMLMediaElement's
+            // ready_state has reached HaveMetadata when this event is processed.
+            // This triggers the autoplay path: StateChanged → playback_state_changed
+            // → change_ready_state(HaveEnoughData) → eligible_for_autoplay → play().
+            notify(observer, PlayerEvent::StateChanged(PlaybackState::Paused));
             notify(observer, PlayerEvent::VideoFrameUpdated);
         },
         Event::PropertyChange { name, change, .. } => match name {
@@ -91,6 +102,7 @@ fn handle_event(
             }
         },
         Event::VideoReconfig => {
+            warn!("mpv event: VideoReconfig");
             let width = mpv.get_property::<i64>("width").unwrap_or(0) as u32;
             let height = mpv.get_property::<i64>("height").unwrap_or(0) as u32;
             notify(

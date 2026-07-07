@@ -1,0 +1,220 @@
+name: Windows Build (media-mpv)
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: 'Build profile'
+        required: false
+        default: 'release'
+        type: choice
+        options:
+          - 'release'
+          - 'checked-release'
+          - 'debug'
+          - 'production'
+
+env:
+  RUST_BACKTRACE: 1
+  CARGO_TARGET_DIR: C:\a\servo\servo\target
+  RUSTUP_WINDOWS_PATH_ADD_BIN: 1
+
+jobs:
+  build:
+    name: Windows Build (${{ inputs.profile }})
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Python
+        uses: ./.github/actions/setup-python
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal --component clippy llvm-tools rustc-dev rustfmt rust-src
+          rustup default 1.95.0
+
+      - name: Bootstrap (fetch dependencies)
+        run: |
+          .\mach fetch
+
+      - name: Install WiX Toolset
+        shell: powershell
+        run: |
+          choco install wixtoolset -y --no-progress
+          $wixPath = "C:\Program Files (x86)\WiX Toolset v3.14"
+          if (Test-Path "$wixPath\bin") {
+            echo "WIX=$wixPath" | Out-File -FilePath $env:GITHUB_ENV -Append
+            echo "$wixPath\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+            echo "WiX installed at $wixPath"
+          } else {
+            $wixPath = "C:\Program Files\WiX Toolset v3.14"
+            if (Test-Path "$wixPath\bin") {
+              echo "WIX=$wixPath" | Out-File -FilePath $env:GITHUB_ENV -Append
+              echo "$wixPath\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+              echo "WiX installed at $wixPath"
+            } else {
+              Get-ChildItem "C:\Program Files*\WiX*" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 5
+              Get-ChildItem "C:\ProgramData\chocolatey\lib\wixtoolset" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 10
+              echo "WiX not found at expected paths"
+              exit 1
+            }
+          }
+
+      - name: Download and install libmpv
+        shell: powershell
+        run: |
+          $url = "https://sourceforge.net/projects/mpv-player-windows/files/libmpv/mpv-dev-x86_64-20260607-git-71ebd08.7z/download"
+          $archive = "$env:TEMP\mpv-dev.7z"
+          echo "Downloading libmpv from SourceForge..."
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          Invoke-WebRequest -Uri $url -OutFile $archive -MaximumRedirection 5
+          echo "Extracting libmpv..."
+          7z x $archive -o"C:\libmpv" -y
+          $mpvDir = Get-ChildItem "C:\libmpv" -Directory | Select-Object -First 1
+          if ($mpvDir) {
+            echo "Found libmpv in: $($mpvDir.FullName)"
+            echo "Contents:"
+            Get-ChildItem $mpvDir.FullName -Recurse -File | Select-Object -First 30
+          }
+          $libDir = Get-ChildItem "C:\libmpv" -Recurse -Directory -Filter "lib*" | Where-Object { Test-Path "$($_.FullName)\mpv.lib" } | Select-Object -First 1
+          $incDir = Get-ChildItem "C:\libmpv" -Recurse -Directory -Filter "include" | Where-Object { Test-Path "$($_.FullName)\mpv" } | Select-Object -First 1
+          $binDir = Get-ChildItem "C:\libmpv" -Recurse -Directory -Filter "bin" | Where-Object { Get-ChildItem $_.FullName -Filter "*mpv*.dll" } | Select-Object -First 1
+          if ($libDir) {
+            echo "LIB_DIR=$($libDir.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+            $currentLib = [Environment]::GetEnvironmentVariable("LIB", "Process")
+            echo "LIB=$currentLib;$($libDir.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+            echo "Library dir: $($libDir.FullName)"
+          } else {
+            echo "ERROR: Could not find mpv.lib in extracted archive"
+            Get-ChildItem "C:\libmpv" -Recurse -Filter "*.lib" | Select-Object FullName
+            exit 1
+          }
+          if ($incDir) {
+            $currentInclude = [Environment]::GetEnvironmentVariable("INCLUDE", "Process")
+            echo "INCLUDE=$currentInclude;$($incDir.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+            echo "Include dir: $($incDir.FullName)"
+          } else {
+            echo "ERROR: Could not find mpv headers"
+            exit 1
+          }
+          if ($binDir) {
+            $dllFile = Get-ChildItem $binDir.FullName -Filter "*mpv*.dll" | Select-Object -First 1
+            if ($dllFile) {
+              echo "MPV_DLL=$($dllFile.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+              echo "DLL: $($dllFile.FullName)"
+            }
+          } else {
+            echo "WARNING: Could not find mpv DLL"
+          }
+
+      - name: Build
+        shell: powershell
+        run: |
+          $targetDir = "C:\a\servo\servo\target\${{ inputs.profile }}"
+          if (Test-Path $targetDir) {
+            echo "Cleaning previous build: $targetDir"
+            Remove-Item -Recurse -Force $targetDir -ErrorAction SilentlyContinue
+          }
+          $profile = "${{ inputs.profile }}"
+          $profileArg = ""
+          if ($profile -eq "release") {
+            $profileArg = "--release"
+          } elseif ($profile -eq "debug") {
+            $profileArg = ""
+          } else {
+            $profileArg = "--profile $profile"
+          }
+          cargo build -p servoshell --features media-mpv --locked $profileArg
+          if ($LASTEXITCODE -ne 0) { throw "Cargo build failed with exit code $LASTEXITCODE" }
+
+      - name: Copy DLLs to binary directory
+        shell: powershell
+        run: |
+          $targetDir = "C:\a\servo\servo\target\${{ inputs.profile }}"
+          $buildDir = "$targetDir\build"
+          echo "Target dir: $targetDir"
+          if (-not (Test-Path $targetDir)) {
+            throw "Target directory not found: $targetDir"
+          }
+          Get-ChildItem $targetDir -Filter "*.exe" | Select-Object Name,Length
+          echo "Looking for ANGLE DLLs in build directory..."
+          $angleDlls = @("libEGL.dll", "libGLESv2.dll")
+          foreach ($dll in $angleDlls) {
+            $found = Get-ChildItem -Path $buildDir -Recurse -Filter $dll -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($found) {
+              Copy-Item $found.FullName -Destination $targetDir -Force
+              echo "Copied $dll from $($found.FullName)"
+            } else {
+              echo "WARNING: $dll not found in build directory"
+            }
+          }
+          echo "Copying libmpv DLL..."
+          if ($env:MPV_DLL -and (Test-Path $env:MPV_DLL)) {
+            Copy-Item $env:MPV_DLL -Destination $targetDir -Force
+            echo "Copied libmpv DLL from $($env:MPV_DLL)"
+          } else {
+            echo "WARNING: MPV_DLL env var not set or file not found"
+          }
+          echo "Copying MSVC redistributable DLLs..."
+          python -c "
+import sys, os
+sys.path.insert(0, '.')
+try:
+    from python.servo.build_commands import package_msvc_dlls
+    from python.servo.platform.build_target import BuildTarget
+    target = BuildTarget.from_triple(None)
+    servo_dir = r'$targetDir'.replace(chr(92), '/')
+    os.makedirs(servo_dir, exist_ok=True)
+    result = package_msvc_dlls(servo_dir, target)
+    if not result:
+        print('WARNING: Some MSVC DLLs could not be copied')
+except Exception as e:
+    print(f'ERROR copying MSVC DLLs: {e}')
+    sys.exit(1)
+"
+          if ($LASTEXITCODE -ne 0) { throw "Failed to copy MSVC DLLs" }
+          echo "DLLs in target directory:"
+          Get-ChildItem $targetDir -Filter "*.dll" | Select-Object Name,Length
+
+      - name: Package (MSI installer)
+        shell: powershell
+        run: |
+          $profile = "${{ inputs.profile }}"
+          $profileArg = ""
+          if ($profile -eq "release") {
+            $profileArg = "--release"
+          } elseif ($profile -eq "debug") {
+            $profileArg = "--dev"
+          } else {
+            $profileArg = "--profile $profile"
+          }
+          .\mach package $profileArg
+          if ($LASTEXITCODE -ne 0) { throw "Package failed with exit code $LASTEXITCODE" }
+
+      - name: Verify installer
+        shell: powershell
+        run: |
+          $msiDir = "C:\a\servo\servo\target\${{ inputs.profile }}\msi"
+          echo "MSI directory contents:"
+          Get-ChildItem $msiDir -Recurse | Select-Object Name,Length
+          $msi = Join-Path $msiDir "Installer.msi"
+          $bundle = Join-Path $msiDir "ServoShell.exe"
+          if (-not (Test-Path $msi)) {
+            echo "ERROR: Installer.msi not found"
+            exit 1
+          }
+          if (-not (Test-Path $bundle)) {
+            echo "ERROR: ServoShell.exe bundle not found"
+            exit 1
+          }
+          echo "Installer.msi: $((Get-Item $msi).Length / 1MB) MB"
+          echo "ServoShell.exe bundle: $((Get-Item $bundle).Length / 1MB) MB"
+          echo "MSI and bundle installer created successfully!"
+
+      - name: Upload installer bundle
+        uses: actions/upload-artifact@v7
+        with:
+          name: ServoShell-${{ inputs.profile }}-setup
+          path: C:\a\servo\servo\target\${{ inputs.profile }}\msi\ServoShell.exe
+          if-no-files-found: error

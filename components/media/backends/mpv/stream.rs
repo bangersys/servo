@@ -7,7 +7,7 @@ use libmpv2::protocol::Protocol;
 use log::error;
 
 const BUFFER_HIGH_WATER: usize = 10 * 1024 * 1024;
-const BUFFER_LOW_WATER: usize = 1 * 1024 * 1024;
+const BUFFER_LOW_WATER: usize = 1024 * 1024;
 
 struct StreamData {
     buffer: Vec<u8>,
@@ -179,8 +179,13 @@ static PROTO: OnceLock<Protocol<'static, StreamCookie, StreamUserData>> = OnceLo
 
 pub fn ensure_protocol(mpv: &Mpv, registry: StreamUserData) {
     PROTO.get_or_init(|| {
+        // NOTE: create_client(None) is used because the safe wrapper's
+        // create_client(Some(name)) has a temporary CString lifetime issue
+        // in the Servo runtime environment (the FFI works fine with a
+        // long-lived CString, but the wrapper's inline CString causes
+        // mpv_create_client to return NULL on mpv 0.41.0).
         let client_mpv = mpv
-            .create_client(Some("servo-protocol"))
+            .create_client(None)
             .expect("Failed to create mpv client for protocol");
         let _client_mpv: &'static Mpv = Box::leak(Box::new(client_mpv));
 
