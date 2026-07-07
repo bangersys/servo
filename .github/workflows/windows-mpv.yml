@@ -39,14 +39,6 @@ jobs:
           .\mach fetch
           .\mach bootstrap-gstreamer
 
-      # Set up MSVC build environment (INCLUDE, LIB, VCINSTALLDIR, etc.)
-      # so clang-cl can find system headers like <array>.
-      # llvm: false avoids putting VS-bundled LLVM on PATH, which would
-      # shadow the standalone LLVM needed by mozangle/clang-sys.
-      - uses: ilammy/msvc-dev-cmd@v1
-        with:
-          llvm: false
-
       # Always install crown, even on self-hosted runners, because it is tightly
       # coupled to the rustc version, and we may have the wrong version if the
       # commit we are building uses a different rustc version.
@@ -164,9 +156,8 @@ jobs:
 
       - name: Build (${{ inputs.profile }})
         env:
-          RUSTFLAGS: ${{ inputs.profile == 'checked-release' && '-D warnings' || '' }}
-          INCLUDE: ${{ env.MPV_INCLUDE_DIR }};${{ env.INCLUDE }}
-          LIB: ${{ env.MPV_LIB_DIR }};${{ env.LIB }}
+          RUSTFLAGS: ${{ inputs.profile == 'checked-release' && '-D warnings' || '' }} -L${{ env.MPV_LIB_DIR }}
+          CXXFLAGS: -I${{ env.MPV_INCLUDE_DIR }}
         run: |
           .\mach build --use-crown --locked --profile ${{ inputs.profile }} --features media-mpv
           mv C:\a\servo\servo\target\cargo-timings C:\a\servo\servo\target\cargo-timings-windows
