@@ -157,22 +157,24 @@ jobs:
             echo "WARNING: MPV_DLL env var not set or file not found"
           }
           echo "Copying MSVC redistributable DLLs..."
-          python -c "
+          $pyScript = @"
 import sys, os
 sys.path.insert(0, '.')
 try:
     from python.servo.build_commands import package_msvc_dlls
     from python.servo.platform.build_target import BuildTarget
     target = BuildTarget.from_triple(None)
-    servo_dir = r'$targetDir'.replace(chr(92), '/')
+    servo_dir = r'''$targetDir'''.replace(chr(92), '/')
     os.makedirs(servo_dir, exist_ok=True)
     result = package_msvc_dlls(servo_dir, target)
     if not result:
         print('WARNING: Some MSVC DLLs could not be copied')
 except Exception as e:
-    print(f'ERROR copying MSVC DLLs: {e}')
+    print('ERROR copying MSVC DLLs: ' + str(e))
     sys.exit(1)
-"
+"@
+          $pyScript | Out-File -FilePath "$env:TEMP\copy_dlls.py" -Encoding utf8
+          python "$env:TEMP\copy_dlls.py"
           if ($LASTEXITCODE -ne 0) { throw "Failed to copy MSVC DLLs" }
           echo "DLLs in target directory:"
           Get-ChildItem $targetDir -Filter "*.dll" | Select-Object Name,Length
