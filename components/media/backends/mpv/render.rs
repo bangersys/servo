@@ -10,12 +10,13 @@ use std::ffi::c_void;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use khronos_egl as egl;
 use libmpv2::Mpv;
 use libmpv2::render::mpv_render_update;
 use libmpv2::render::{OpenGLInitParams, RenderParam, RenderParamApiType};
-use log::{error, warn};
+use log::{debug, error, warn};
 use servo_base::generic_channel::GenericCallback;
 use servo_media_player::PlayerEvent;
 use servo_media_player::context::{GlApi, GlContext, NativeDisplay, PlayerGLContext};
@@ -60,6 +61,7 @@ struct GlFunctions {
         *const c_void,
     ),
     gl_viewport: unsafe extern "system" fn(GLint, GLint, GLsizei, GLsizei),
+    gl_flush: unsafe extern "system" fn(),
 }
 
 #[allow(clippy::missing_transmute_annotations)]
@@ -86,6 +88,7 @@ fn load_gl_functions(egl: &egl::DynamicInstance<egl::EGL1_4>) -> Option<GlFuncti
         gl_bind_texture: load!("glBindTexture"),
         gl_tex_image_2d: load!("glTexImage2D"),
         gl_viewport: load!("glViewport"),
+        gl_flush: load!("glFlush"),
     })
 }
 
@@ -427,6 +430,8 @@ fn gl_render_thread_main(
     let mut fbo_pool: Vec<(GLuint, GLuint)> = Vec::new();
     let mut current_width: i32 = 0;
     let mut current_height: i32 = 0;
+    let mut last_frame_time = Instant::now();
+    let target_frame_duration = Duration::from_millis(16); // ~60fps
 
     'render: loop {
         let cmd = match rx.recv() {
@@ -518,6 +523,11 @@ fn gl_render_thread_main(
             continue;
         }
 
+        // Flush to ensure GPU finishes writing the texture before Servo reads it.
+        unsafe {
+            (gl.gl_flush)();
+        }
+
         let frame = VideoFrame::new(
             width,
             height,
@@ -538,6 +548,13 @@ fn gl_render_thread_main(
         if let Ok(guard) = observer.lock() {
             let _ = guard.send(PlayerEvent::VideoFrameUpdated);
         }
+
+        // Frame pacing: sleep if we rendered faster than target frame rate.
+        let elapsed = last_frame_time.elapsed();
+        if elapsed < target_frame_duration {
+            thread::sleep(target_frame_duration - elapsed);
+        }
+        last_frame_time = Instant::now();
     }
 
     // ---------- 14. Cleanup ----------
@@ -601,7 +618,7 @@ fn sw_render_thread_main(
         warn!("sw_render_thread: mpv_render_context_create failed: {result}");
         return;
     }
-    warn!("sw_render_thread: mpv_render_context_create OK");
+    debug!("sw_render_thread: mpv_render_context_create OK");
 
     let render_ctx: Box<libmpv2_sys::mpv_render_context> = unsafe { Box::from_raw(ctx_ptr) };
     // We need a raw pointer we can pass through FFI for the update callback.
@@ -624,23 +641,25 @@ fn sw_render_thread_main(
     }
 
     // ---------- 3. Render loop ----------
-    warn!("sw_render_thread: entering render loop");
-    let mut pixel_data: Vec<u8> = Vec::new();
+    debug!("sw_render_thread: entering render loop");
+    let mut write_buf: Vec<u8> = Vec::new();
     let mut current_width: i32 = 0;
     let mut current_height: i32 = 0;
+    let mut last_frame_time = Instant::now();
+    let target_frame_duration = Duration::from_millis(16); // ~60fps
 
     'render: loop {
         let cmd = match rx.recv() {
             Ok(c) => c,
             Err(_) => {
-                warn!("sw_render_thread: channel closed, exiting");
+                debug!("sw_render_thread: channel closed, exiting");
                 break 'render;
             },
         };
 
         match cmd {
             RenderCommand::Shutdown => {
-                warn!("sw_render_thread: Shutdown received");
+                debug!("sw_render_thread: Shutdown received");
                 break 'render;
             },
             RenderCommand::Wakeup => {},
@@ -649,7 +668,6 @@ fn sw_render_thread_main(
         let flags = unsafe { libmpv2_sys::mpv_render_context_update(ctx_raw) };
 
         if flags & (libmpv2_sys::mpv_render_update_flag_MPV_RENDER_UPDATE_FRAME as u64) == 0 {
-            warn!("sw_render_thread: update returned flags={flags}, no frame");
             continue;
         }
 
@@ -657,17 +675,14 @@ fn sw_render_thread_main(
         let height = mpv.get_property::<i64>("height").unwrap_or(0) as i32;
 
         if width <= 0 || height <= 0 {
-            warn!("sw_render_thread: invalid dimensions {width}x{height}");
             continue;
         }
-
-        warn!("sw_render_thread: rendering frame {width}x{height}");
 
         // Allocate or grow the pixel buffer when the video size changes.
         if width != current_width || height != current_height {
             let stride = width * 4; // BGRA8 = 4 bytes per pixel
             let size = (stride * height) as usize;
-            pixel_data.resize(size, 0u8);
+            write_buf.resize(size, 0u8);
             current_width = width;
             current_height = height;
         }
@@ -695,7 +710,7 @@ fn sw_render_thread_main(
         // SW_POINTER: void*
         render_params.push(libmpv2_sys::mpv_render_param {
             type_: libmpv2_sys::mpv_render_param_type_MPV_RENDER_PARAM_SW_POINTER,
-            data: pixel_data.as_mut_ptr() as *mut std::ffi::c_void,
+            data: write_buf.as_mut_ptr() as *mut std::ffi::c_void,
         });
         // terminator
         render_params.push(libmpv2_sys::mpv_render_param {
@@ -716,11 +731,14 @@ fn sw_render_thread_main(
             continue;
         }
 
+        // Move ownership of the buffer into the frame; replace with an empty Vec
+        // so the next frame gets a fresh buffer without cloning.
+        let filled_buf = std::mem::replace(&mut write_buf, Vec::new());
         let frame = VideoFrame::new(
             width,
             height,
             Arc::new(SwBuffer {
-                data: Arc::new(pixel_data.clone()),
+                data: Arc::new(filled_buf),
                 width,
                 height,
             }),
@@ -731,18 +749,21 @@ fn sw_render_thread_main(
             && let Ok(mut guard) = video_renderer.lock()
         {
             guard.render(frame);
-            warn!("sw_render_thread: frame rendered and sent to VideoFrameRenderer");
-        } else {
-            warn!("sw_render_thread: frame NOT rendered (missing VideoFrameRenderer)");
         }
 
         if let Ok(guard) = observer.lock() {
             let _ = guard.send(PlayerEvent::VideoFrameUpdated);
-            warn!("sw_render_thread: VideoFrameUpdated sent");
         }
+
+        // Frame pacing: sleep if we rendered faster than target frame rate.
+        let elapsed = last_frame_time.elapsed();
+        if elapsed < target_frame_duration {
+            thread::sleep(target_frame_duration - elapsed);
+        }
+        last_frame_time = Instant::now();
     }
 
-    warn!("sw_render_thread: exiting");
+    debug!("sw_render_thread: exiting");
     // ---------- 4. Cleanup ----------
     unsafe {
         libmpv2_sys::mpv_render_context_free(ctx_raw);

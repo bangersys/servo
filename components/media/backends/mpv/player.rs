@@ -31,6 +31,12 @@ pub struct MpvPlayer {
     stream_id: u64,
     stream_type: StreamType,
     stream_registry: Arc<Mutex<StreamRegistry>>,
+    // Keeps this player's "servo://" protocol registration (and the mpv
+    // client handle it borrows) alive for as long as the player exists.
+    // Each player registers the protocol on its own mpv core -- see
+    // `stream::register_protocol` for why this can't be a one-time,
+    // process-wide registration.
+    _protocol_handle: stream::ProtocolHandle,
     loaded: Mutex<bool>,
     observer: Arc<Mutex<GenericCallback<PlayerEvent>>>,
 }
@@ -59,12 +65,16 @@ impl MpvPlayer {
         mpv.observe_property("time-pos", Format::Double, 0).ok();
         mpv.observe_property("pause", Format::Flag, 0).ok();
 
-        let registry = Arc::new(Mutex::new(StreamRegistry::new()));
-        let (stream_id, stream) = registry.lock().unwrap().register();
-        stream::ensure_protocol(&mpv, registry.clone());
+        let observer = Arc::new(Mutex::new(observer));
+
+        // Use the shared, process-wide stream registry (safe because
+        // protocol registration below is scoped to this player's own mpv
+        // core -- see `stream::register_protocol`).
+        let registry = stream::global_registry();
+        let (stream_id, stream) = registry.lock().unwrap().register(observer.clone());
+        let protocol_handle = stream::register_protocol(&mpv, registry.clone());
 
         let mpv_arc = Arc::new(mpv);
-        let observer = Arc::new(Mutex::new(observer));
         start_event_loop(mpv_arc.clone(), observer.clone());
 
         let render_handle = render::spawn_render_thread(
@@ -84,6 +94,7 @@ impl MpvPlayer {
             stream_id,
             stream_type,
             stream_registry: registry,
+            _protocol_handle: protocol_handle,
             loaded: Mutex::new(false),
             observer,
         }
@@ -182,6 +193,7 @@ impl Player for MpvPlayer {
 
     fn set_input_size(&self, size: u64) -> Result<(), PlayerError> {
         warn!("mpv set_input_size: {} bytes", size);
+        self.stream.set_size(size);
         self.load_if_needed()?;
         Ok(())
     }
